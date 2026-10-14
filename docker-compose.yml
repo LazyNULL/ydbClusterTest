@@ -1,0 +1,189 @@
+name: ydb-cluster-test
+
+volumes:
+  ydb-node-1-data:
+  ydb-node-2-data:
+  ydb-node-3-data:
+
+services:
+  # ---------------------------------------------------------------------------
+  # Кластер YDB: три статические ноды (mirror-3-dc).
+  # Штатный entrypoint образа local-ydb разворачивает только одну ноду,
+  # поэтому он переопределён: каждый контейнер запускает ydbd напрямую
+  # со своим номером ноды (--node N) и общим конфигом кластера.
+  # Встроенный HEALTHCHECK образа (/health_check) продолжает работать.
+  # ---------------------------------------------------------------------------
+  ydb-node-1: &ydb-node
+    image: ydbplatform/local-ydb:26.3.1.19
+    hostname: ydb-node-1
+    restart: unless-stopped
+    environment:
+      GRPC_PORT: "2136"            # используется встроенным healthcheck
+      YDB_DEFAULT_LOG_LEVEL: NOTICE
+    # Встроенный HEALTHCHECK образа (DDL-проба на /local) не проходит до
+    # разовой инициализации blob storage (сервис ydb-init), поэтому он
+    # переопределён на простую проверку готовности ноды.
+    healthcheck:
+      test: ["CMD", "/ydb", "--endpoint", "grpc://localhost:2136", "--database", "/local", "--no-discovery", "sql", "-s", "select 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 15s
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        mkdir -p /ydb_data/pdisks
+        for d in 1 2 3; do
+          if [ ! -f /ydb_data/pdisks/pdisk_$$d.img ]; then
+            echo "Creating pdisk file $$d (8G)..."
+            truncate -s 8G /ydb_data/pdisks/pdisk_$$d.img
+          fi
+        done
+        exec /ydbd server --yaml-config /ydb_data/cluster/kikimr_configs/config.yaml --node 1 --mon-port 8765
+    volumes:
+      - ./ydb/config.yaml:/ydb_data/cluster/kikimr_configs/config.yaml:ro
+      - ydb-node-1-data:/ydb_data
+    ports:
+      - "2136:2136"   # gRPC
+      - "8765:8765"   # встроенный веб-интерфейс (monitoring)
+
+  ydb-node-2:
+    <<: *ydb-node
+    hostname: ydb-node-2
+    command:
+      - |
+        mkdir -p /ydb_data/pdisks
+        for d in 1 2 3; do
+          if [ ! -f /ydb_data/pdisks/pdisk_$$d.img ]; then
+            echo "Creating pdisk file $$d (8G)..."
+            truncate -s 8G /ydb_data/pdisks/pdisk_$$d.img
+          fi
+        done
+        exec /ydbd server --yaml-config /ydb_data/cluster/kikimr_configs/config.yaml --node 2 --mon-port 8765
+    volumes:
+      - ./ydb/config.yaml:/ydb_data/cluster/kikimr_configs/config.yaml:ro
+      - ydb-node-2-data:/ydb_data
+    ports:
+      - "2236:2136"   # gRPC
+      - "8766:8765"   # monitoring
+
+  ydb-node-3:
+    <<: *ydb-node
+    hostname: ydb-node-3
+    command:
+      - |
+        mkdir -p /ydb_data/pdisks
+        for d in 1 2 3; do
+          if [ ! -f /ydb_data/pdisks/pdisk_$$d.img ]; then
+            echo "Creating pdisk file $$d (8G)..."
+            truncate -s 8G /ydb_data/pdisks/pdisk_$$d.img
+          fi
+        done
+        exec /ydbd server --yaml-config /ydb_data/cluster/kikimr_configs/config.yaml --node 3 --mon-port 8765
+    volumes:
+      - ./ydb/config.yaml:/ydb_data/cluster/kikimr_configs/config.yaml:ro
+      - ydb-node-3-data:/ydb_data
+    ports:
+      - "2336:2136"   # gRPC
+      - "8767:8765"   # monitoring
+
+  # ---------------------------------------------------------------------------
+  # Одноразовый сервис: ждёт готовности кластера, инициализирует blob storage
+  # и создаёт базу /local/testdb. Выполняется при первом подъёме; при
+  # перезапуске контейнеров (restart/recreate) база сохраняется в named
+  # volumes, и сервис ничего не делает повторно.
+  # ---------------------------------------------------------------------------
+  ydb-init:
+    image: ydbplatform/local-ydb:26.3.1.19
+    restart: "no"
+    depends_on:
+      ydb-node-1:
+        condition: service_healthy
+      ydb-node-2:
+        condition: service_healthy
+      ydb-node-3:
+        condition: service_healthy
+    volumes:
+      - ./ydb/config.yaml:/ydb_data/cluster/kikimr_configs/config.yaml:ro
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -e
+        echo "Waiting for the cluster to accept connections..."
+        ready=""
+        for i in $$(seq 1 60); do
+          if /ydb --endpoint grpc://ydb-node-1:2136 --database /local discovery whoami >/dev/null 2>&1; then
+            echo "Cluster is ready."
+            ready=1
+            break
+          fi
+          echo "Not ready yet, retry $$i/60..."
+          sleep 5
+        done
+        if [ -z "$$ready" ]; then
+          echo "ERROR: cluster did not become ready in time" >&2
+          exit 1
+        fi
+        if /ydb --endpoint grpc://ydb-node-1:2136 --database /local scheme ls /local 2>/dev/null | grep -q testdb; then
+          echo "Database /local/testdb already exists, nothing to do."
+          exit 0
+        fi
+        echo "Initializing blob storage configuration..."
+        /ydbd -s grpc://ydb-node-1:2136 admin blobstorage config init --yaml-file /ydb_data/cluster/kikimr_configs/config.yaml
+        echo "Creating database /local/testdb..."
+        /ydbd -s grpc://ydb-node-1:2136 admin database /local/testdb create ssd:1
+        echo "Databases in /local:"
+        /ydb --endpoint grpc://ydb-node-1:2136 --database /local scheme ls /local
+
+  # ---------------------------------------------------------------------------
+  # Динамическая нода (tenant-нода) для базы /local/testdb. Статические ноды
+  # обслуживают только корневой домен /local, поэтому для работы с базой нужна
+  # как минимум одна динамическая нода (см. документацию V1, "Run Dynamic Nodes").
+  # ---------------------------------------------------------------------------
+  ydb-dynnode:
+    image: ydbplatform/local-ydb:26.3.1.19
+    hostname: ydb-dynnode
+    restart: unless-stopped
+    environment:
+      YDB_DEFAULT_LOG_LEVEL: NOTICE
+    depends_on:
+      ydb-init:
+        condition: service_completed_successfully
+    volumes:
+      - ./ydb/config.yaml:/ydb_data/cluster/kikimr_configs/config.yaml:ro
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        exec /ydbd server \
+          --yaml-config /ydb_data/cluster/kikimr_configs/config.yaml \
+          --tenant /local/testdb \
+          --node-broker grpc://ydb-node-1:2136 \
+          --node-broker grpc://ydb-node-2:2136 \
+          --node-broker grpc://ydb-node-3:2136 \
+          --grpc-port 2136 \
+          --ic-port 19002 \
+          --mon-port 8765
+    ports:
+      - "3136:2136"   # gRPC динамической ноды (для прямых подключений)
+      - "8768:8765"   # monitoring динамической ноды
+    # Встроенный healthcheck образа проверяет базу /local, которую динамическая
+    # нода не обслуживает, поэтому он отключён; готовность проверяет приложение.
+    healthcheck:
+      disable: true
+
+  # ---------------------------------------------------------------------------
+  # Тестовое Java-приложение (JDBC): создаёт таблицу, пишет и читает данные.
+  # Запускается один раз после создания базы; повторный прогон:
+  #   docker compose run --rm app
+  # ---------------------------------------------------------------------------
+  app:
+    build: ./app
+    image: ydb-test-app:latest
+    restart: "no"
+    depends_on:
+      ydb-init:
+        condition: service_completed_successfully
+      ydb-dynnode:
+        condition: service_started
+    environment:
+      YDB_CONNECTION_STRING: jdbc:ydb:grpc://ydb-node-1:2136/local/testdb

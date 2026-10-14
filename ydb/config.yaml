@@ -1,0 +1,163 @@
+# Статическая конфигурация кластера YDB из трёх нод (mirror-3-dc), формат V1.
+# Адаптировано из официальной документации "Deploying a Cluster Using Configuration V1"
+# (ydb.tech, вариант mirror-3dc-3nodes) и примера ydb/deploy/yaml_config_examples.
+#
+# Ноды: ydb-node-1, ydb-node-2, ydb-node-3 (по одной на «дата-центр» 1, 2, 3).
+# Данные: файловые pdisk /ydb_data/pdisks/pdisk_{1,2,3}.img (по 8 ГБ на диск,
+# создаются при старте контейнера). Корневой домен: /local (имя важно:
+# встроенный healthcheck образа local-ydb обращается к базе /local).
+#
+# После старта нод требуется разовая инициализация кластера (сервис ydb-init):
+#   ydbd -s grpc://ydb-node-1:2136 admin blobstorage config init --yaml-file <этот файл>
+#   ydbd -s grpc://ydb-node-1:2136 admin database /local/testdb create ssd:1
+static_erasure: mirror-3-dc
+fail_domain_type: disk
+
+host_configs:
+- host_config_id: 1
+  drive:
+  - path: /ydb_data/pdisks/pdisk_1.img
+    type: SSD
+  - path: /ydb_data/pdisks/pdisk_2.img
+    type: SSD
+  - path: /ydb_data/pdisks/pdisk_3.img
+    type: SSD
+
+hosts:
+- host: ydb-node-1
+  host_config_id: 1
+  walle_location:
+    body: 1
+    data_center: '1'
+    rack: '1'
+- host: ydb-node-2
+  host_config_id: 1
+  walle_location:
+    body: 2
+    data_center: '2'
+    rack: '2'
+- host: ydb-node-3
+  host_config_id: 1
+  walle_location:
+    body: 3
+    data_center: '3'
+    rack: '3'
+
+domains_config:
+  # Корневой домен кластера.
+  domain:
+  - name: local
+    storage_pool_types:
+    - kind: ssd
+      pool_config:
+        box_id: 1
+        erasure_species: mirror-3-dc
+        kind: ssd
+        geometry:
+          realm_level_begin: 10
+          realm_level_end: 20
+          domain_level_begin: 10
+          domain_level_end: 256
+        pdisk_filter:
+        - property:
+          - type: SSD
+        vdisk_kind: Default
+  state_storage:
+  - ring:
+      node: [1, 2, 3]
+      nto_select: 3
+    ssid: 1
+
+blob_storage_config:
+  # Статическая группа хранения: 9 vdisk'ов — по 3 диска на каждой из трёх нод
+  # (mirror-3-dc требует не менее 3 fail-доменов в каждом кольце).
+  service_set:
+    groups:
+    - erasure_species: mirror-3-dc
+      rings:
+      - fail_domains:
+        - vdisk_locations:
+          - node_id: ydb-node-1
+            pdisk_category: SSD
+            path: /ydb_data/pdisks/pdisk_1.img
+        - vdisk_locations:
+          - node_id: ydb-node-1
+            pdisk_category: SSD
+            path: /ydb_data/pdisks/pdisk_2.img
+        - vdisk_locations:
+          - node_id: ydb-node-1
+            pdisk_category: SSD
+            path: /ydb_data/pdisks/pdisk_3.img
+      - fail_domains:
+        - vdisk_locations:
+          - node_id: ydb-node-2
+            pdisk_category: SSD
+            path: /ydb_data/pdisks/pdisk_1.img
+        - vdisk_locations:
+          - node_id: ydb-node-2
+            pdisk_category: SSD
+            path: /ydb_data/pdisks/pdisk_2.img
+        - vdisk_locations:
+          - node_id: ydb-node-2
+            pdisk_category: SSD
+            path: /ydb_data/pdisks/pdisk_3.img
+      - fail_domains:
+        - vdisk_locations:
+          - node_id: ydb-node-3
+            pdisk_category: SSD
+            path: /ydb_data/pdisks/pdisk_1.img
+        - vdisk_locations:
+          - node_id: ydb-node-3
+            pdisk_category: SSD
+            path: /ydb_data/pdisks/pdisk_2.img
+        - vdisk_locations:
+          - node_id: ydb-node-3
+            pdisk_category: SSD
+            path: /ydb_data/pdisks/pdisk_3.img
+
+channel_profile_config:
+  profile:
+  - profile_id: 0
+    channel:
+    - erasure_species: mirror-3-dc
+      pdisk_category: 1
+      storage_pool_kind: ssd
+    - erasure_species: mirror-3-dc
+      pdisk_category: 1
+      storage_pool_kind: ssd
+    - erasure_species: mirror-3-dc
+      pdisk_category: 1
+      storage_pool_kind: ssd
+
+table_service_config:
+  sql_version: 1
+
+actor_system_config:
+  executor:
+  - name: System
+    threads: 2
+    type: BASIC
+  - name: User
+    threads: 3
+    type: BASIC
+  - name: Batch
+    threads: 2
+    type: BASIC
+  - name: IO
+    threads: 1
+    time_per_mailbox_micro_secs: 100
+    type: IO
+  - name: IC
+    spin_threshold: 10
+    threads: 1
+    time_per_mailbox_micro_secs: 100
+    type: BASIC
+  scheduler:
+    progress_threshold: 10000
+    resolution: 256
+    spin_threshold: 0
+
+grpc_config:
+  port: 2136
+  services_enabled:
+  - legacy
